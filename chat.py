@@ -4,14 +4,18 @@ from anthropic import Anthropic
 from pathlib import Path
 from TodoManager import TodoManager
 from SkillRegistry import SkillRegistry
+from Compactor import persist_large_output, maybe_compact
 
 SAFE_DIRS = [
     Path("/tmp/safe_dir"),
     Path(__file__).resolve().parent,
 ];
+
 todo_manager = TodoManager()
 skill_registry = SkillRegistry()
 skill_registry.load_from_dir("skills")
+
+
 
 def safe_path(p: str) -> Path:
     target = (Path.cwd() / p).resolve()
@@ -169,8 +173,15 @@ def run_tool_loop(state) -> None:
     """
     与 LLM 对话，自动处理 tool_use → tool_result 循环，
     直到 LLM 不再调用 tool 为止。
+
+    大输出自动持久化到磁盘（> PERSIST_THRESHOLD），
+    messages 总大小超过 COMPACT_THRESHOLD 时触发压缩。
     """
     while True:
+        # 检查是否需要压缩（每轮只做一次）
+        maybe_compact(state)
+
+
         messages = normalize_messages(state["messages"])
         response = client.messages.create(
             model="deepseek-chat",
@@ -199,13 +210,20 @@ def run_tool_loop(state) -> None:
                 tool_handler = TOOL_HANDLERS.get(block.name)
                 if tool_handler:
                     output = tool_handler(**block.input)
+                    # 大输出持久化
+                    persisted = persist_large_output(block.id, output)
                     results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": output,
+                        "content": persisted,
                     })
                     if block.name == "todo":
                         todo_was_called = True
+                    # 追踪最近碰过的文件
+                    if block.name == "read_file":
+                        fpath = block.input.get("path", "")
+                        if fpath and fpath not in state["recent_files"]:
+                            state["recent_files"].append(fpath)
 
         if not todo_was_called:
             todo_manager.tick()
@@ -222,6 +240,7 @@ def run_tool_loop(state) -> None:
         })
         state["turn_count"] += 1
         state["transition_reason"] = "tool_use"
+
 
 
 def agent_loop(state):
@@ -245,7 +264,11 @@ if __name__ == "__main__":
         "results": [],
         "turn_count": 0,
         "transition_reason": None,
+        "has_compacted": False,       # 这一轮之前是否已经做过完整压缩
+        "last_summary": "",           # 最近一次压缩得到的摘要
+        "recent_files": [],           # 最近碰过哪些文件，压缩后方便继续追踪
     }
+
 
     # 支持命令行参数作为首次输入
     if len(sys.argv) > 1:
